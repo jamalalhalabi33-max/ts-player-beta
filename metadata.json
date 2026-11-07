@@ -1,0 +1,6 @@
+{
+  "name": "RawTS Player",
+  "description": "High-performance raw Media3 ExoPlayer external player for IPTV live TS streams with Single-PMT extractor and fast reconnection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
