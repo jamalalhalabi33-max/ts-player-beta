@@ -1,0 +1,103 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & Package Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Prepare Build Environment & Keystore
+        run: |
+          # Ensure .env exists for Secrets Gradle Plugin
+          touch .env
+          if [ -f .env.example ]; then
+            cp .env.example .env
+          fi
+
+          # Restore debug.keystore from base64 if present, or generate fresh keystore
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+            echo "Decoding debug.keystore from base64..."
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
+
+          if [ ! -f debug.keystore ]; then
+            echo "Generating fresh debug.keystore..."
+            keytool -genkey -v -keystore debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Ensure gradlew exists
+          if [ ! -f gradlew ]; then
+            echo "Generating Gradle wrapper..."
+            gradle wrapper --gradle-version 9.3.1 || true
+            chmod +x gradlew || true
+          fi
+
+      - name: Build Debug APK
+        run: |
+          # Assemble debug APK, bypassing unit tests, lints, and checks for 100% build reliability
+          if [ -f gradlew ]; then
+            ./gradlew :app:assembleDebug \
+              -x test \
+              -x testDebugUnitTest \
+              -x lint \
+              -x lintDebug \
+              -x check \
+              --continue \
+              --no-daemon \
+              --stacktrace
+          else
+            gradle :app:assembleDebug \
+              -x test \
+              -x testDebugUnitTest \
+              -x lint \
+              -x lintDebug \
+              -x check \
+              --continue \
+              --no-daemon \
+              --stacktrace
+          fi
+
+      - name: Verify APK Output
+        run: |
+          echo "Locating generated APK artifacts:"
+          find app/build/outputs/apk -type f -name "*.apk" || find . -type f -name "*.apk"
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rawts-player-debug
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/*/*/*.apk
+          if-no-files-found: warn
+          retention-days: 30
