@@ -35,11 +35,9 @@ jobs:
 
       - name: Prepare Build Environment & Keystore
         run: |
-          # Ensure .env exists for Secrets Gradle Plugin
+          # Ensure .env and .env.example exist for Secrets Gradle Plugin
           touch .env
-          if [ -f .env.example ]; then
-            cp .env.example .env
-          fi
+          touch .env.example
 
           # Restore debug.keystore from base64 if present, or generate fresh keystore
           if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
