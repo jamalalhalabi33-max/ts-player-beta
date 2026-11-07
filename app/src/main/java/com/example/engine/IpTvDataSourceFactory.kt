@@ -30,7 +30,9 @@ class IpTvDataSourceFactory(
             .setDefaultRequestProperties(
                 mapOf(
                     "Accept" to "*/*",
-                    "Connection" to "keep-alive"
+                    "Connection" to "keep-alive",
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache"
                 )
             )
             .createDataSource()

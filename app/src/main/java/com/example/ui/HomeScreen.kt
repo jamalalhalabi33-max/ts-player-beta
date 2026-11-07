@@ -948,7 +948,7 @@ private fun EngineSettingsTab(
                             fontWeight = FontWeight.SemiBold
                         )
                         Text(
-                            text = "Simultaneous video layer opacity and audio volume interpolation:",
+                            text = "Video layer opacity crossfade with instant non-echo audio handover:",
                             color = TextSecondary,
                             fontSize = 11.sp
                         )
@@ -956,10 +956,10 @@ private fun EngineSettingsTab(
                         Spacer(modifier = Modifier.height(8.dp))
 
                         val transitions = listOf(
-                            300L to "300ms",
+                            250L to "250ms",
+                            350L to "350ms",
                             500L to "500ms (Default)",
-                            800L to "800ms",
-                            1000L to "1.0s"
+                            800L to "800ms"
                         )
                         SingleChoiceSegmentedButtonRow(
                             modifier = Modifier.fillMaxWidth()
@@ -989,7 +989,7 @@ private fun EngineSettingsTab(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
-                                text = "How it works: Player A plays the active stream while Player B prepares the next refreshed stream. Once B's first video frame is decoded and rendered, a smooth ${settings.seamlessCrossfadeDurationMs}ms simultaneous video/audio crossfade occurs. A and B alternate indefinitely.",
+                                text = "How it works: Player A plays the active stream while Player B prepares the next refreshed stream. Once ready, video crossfades smoothly while audio switches instantly with zero echo. Players A and B alternate indefinitely across unlimited chunks (A → B → C → D → ...).",
                                 color = TextPrimary,
                                 fontSize = 11.sp,
                                 lineHeight = 16.sp,

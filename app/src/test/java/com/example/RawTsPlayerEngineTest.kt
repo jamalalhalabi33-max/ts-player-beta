@@ -85,10 +85,10 @@ class RawTsPlayerEngineTest {
         val settings = PlayerSettings(
             seamlessPlaybackEnabled = true,
             seamlessSegmentDurationSec = 25,
-            seamlessCrossfadeDurationMs = 800L
+            seamlessCrossfadeDurationMs = 350L
         )
         assertTrue(settings.seamlessPlaybackEnabled)
         assertEquals(25, settings.seamlessSegmentDurationSec)
-        assertEquals(800L, settings.seamlessCrossfadeDurationMs)
+        assertEquals(350L, settings.seamlessCrossfadeDurationMs)
     }
 }

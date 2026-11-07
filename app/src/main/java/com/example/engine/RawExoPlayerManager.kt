@@ -5,7 +5,6 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.OptIn
-import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -27,8 +26,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.cos
-import kotlin.math.sin
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class PlayerTelemetry(
     val playbackState: Int = Player.STATE_IDLE,
@@ -59,6 +58,7 @@ class RawExoPlayerManager(
     private var playerA: ExoPlayer? = null
     private var playerB: ExoPlayer? = null
 
+    private var baseStreamUri: Uri? = null
     private var currentUri: Uri? = null
     private var currentTitle: String = ""
     private val handler = Handler(Looper.getMainLooper())
@@ -66,6 +66,7 @@ class RawExoPlayerManager(
     private var telemetryJob: Job? = null
     private var seamlessLoopJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Main)
+    private val transitionMutex = Mutex()
 
     // Active player index: 0 for Player A, 1 for Player B
     private val _activePlayerIndex = MutableStateFlow(0)
@@ -86,6 +87,7 @@ class RawExoPlayerManager(
 
     private var cycleCounter = 0
     private var isPreparingBackground = false
+    private var earlyTransitionRequested = false
 
     private val _telemetry = MutableStateFlow(PlayerTelemetry())
     val telemetry: StateFlow<PlayerTelemetry> = _telemetry.asStateFlow()
@@ -106,6 +108,10 @@ class RawExoPlayerManager(
             playerB = createExoPlayerInstance(1)
         }
         return playerB!!
+    }
+
+    private fun getPlayerByIndex(index: Int): ExoPlayer {
+        return if (index == 0) getPlayerA() else getPlayerB()
     }
 
     val isSeamlessEnabled: Boolean
@@ -142,11 +148,15 @@ class RawExoPlayerManager(
                     if (playbackState == Player.STATE_READY) {
                         retryCount = 0
                     }
-                    // If active player reaches STATE_ENDED and seamless playback is active,
-                    // trigger immediate emergency transition if background player is ready!
+                    // When the active player reaches STATE_ENDED (stream segment terminated upstream),
+                    // trigger immediate handover to the waiting player
                     if (playbackState == Player.STATE_ENDED && settings.seamlessPlaybackEnabled) {
-                        handleActivePlayerEndedEarly()
+                        earlyTransitionRequested = true
+                        handleEarlyTransition()
                     }
+                } else {
+                    // Background player state update
+                    updateTelemetryState()
                 }
             }
 
@@ -182,8 +192,9 @@ class RawExoPlayerManager(
                     )
 
                     if (settings.seamlessPlaybackEnabled) {
-                        // Check if idle player is ready to take over
-                        handleActivePlayerEndedEarly()
+                        // Handover to prepared idle player on error
+                        earlyTransitionRequested = true
+                        handleEarlyTransition()
                     } else if (settings.fastReconnectEnabled && retryCount <= settings.maxRetryAttempts) {
                         handler.postDelayed({
                             retryPlaybackSingle()
@@ -197,10 +208,13 @@ class RawExoPlayerManager(
     }
 
     fun playStream(uri: Uri, title: String = "") {
+        baseStreamUri = uri
         currentUri = uri
         currentTitle = title
         retryCount = 0
         cycleCounter = 0
+        earlyTransitionRequested = false
+        isPreparingBackground = false
 
         seamlessLoopJob?.cancel()
 
@@ -212,13 +226,19 @@ class RawExoPlayerManager(
             _alphaB.value = 0f
             pA.volume = 1f
             val mediaSource = createMediaSource(uri)
-            pA.setMediaSource(mediaSource)
+            pA.setMediaSource(mediaSource, /* resetPosition = */ true)
             pA.prepare()
             pA.playWhenReady = true
         } else {
-            // Dual-Player Seamless Mode
+            // Dual-Player Seamless Mode (unlimited chunks)
             val pA = getPlayerA()
             val pB = getPlayerB()
+
+            pA.stop()
+            pA.clearMediaItems()
+            pB.stop()
+            pB.clearMediaItems()
+
             _activePlayerIndex.value = 0
             _alphaA.value = 1f
             _alphaB.value = 0f
@@ -229,147 +249,187 @@ class RawExoPlayerManager(
 
             // Start Player A with initial stream
             val initialSource = createMediaSource(generateRefreshedUri(uri, 0))
-            pA.setMediaSource(initialSource)
+            pA.setMediaSource(initialSource, /* resetPosition = */ true)
             pA.prepare()
             pA.playWhenReady = true
 
-            // Launch seamless transition loop
+            // Start unlimited alternating cycle loop: A -> B -> A -> B -> ...
             startSeamlessLoop()
         }
 
         startTelemetryPolling()
     }
 
+    /**
+     * Alternating dual-player loop that runs indefinitely across unlimited stream chunks:
+     * Cycle 1: Player A (active) -> Player B (background) -> transition -> Player B (active)
+     * Cycle 2: Player B (active) -> Player A (background) -> transition -> Player A (active)
+     * Cycle 3: Player A (active) -> Player B (background) -> transition -> Player B (active)
+     * ...
+     */
     private fun startSeamlessLoop() {
         seamlessLoopJob?.cancel()
         seamlessLoopJob = scope.launch {
             val segmentDurationMs = (settings.seamlessSegmentDurationSec * 1000L).coerceAtLeast(10_000L)
-            val crossfadeDurationMs = settings.seamlessCrossfadeDurationMs.coerceIn(200L, 2000L)
-            val prepLeadTimeMs = 6000L.coerceAtMost(segmentDurationMs / 3)
+            val crossfadeDurationMs = settings.seamlessCrossfadeDurationMs.coerceIn(150L, 1000L)
+            // Start preparing background player 8-10 seconds before segment end
+            val prepLeadTimeMs = 8000L.coerceAtMost(segmentDurationMs / 2)
+            val waitBeforePrepMs = (segmentDurationMs - prepLeadTimeMs).coerceAtLeast(2000L)
 
             while (isActive && settings.seamlessPlaybackEnabled) {
+                earlyTransitionRequested = false
                 val currentActiveIndex = _activePlayerIndex.value
-                val activePlayer = if (currentActiveIndex == 0) getPlayerA() else getPlayerB()
-                val idlePlayer = if (currentActiveIndex == 0) getPlayerB() else getPlayerA()
                 val idleIndex = if (currentActiveIndex == 0) 1 else 0
+                val activePlayer = getPlayerByIndex(currentActiveIndex)
+                val idlePlayer = getPlayerByIndex(idleIndex)
 
-                // 1. Wait until prepLeadTimeMs before segment ends
-                val waitBeforePrepMs = (segmentDurationMs - prepLeadTimeMs).coerceAtLeast(1000L)
-                delay(waitBeforePrepMs)
+                // 1. Wait until preparation time, while checking if active player ended early
+                var elapsedMs = 0L
+                val pollStepMs = 200L
+                while (isActive && elapsedMs < waitBeforePrepMs) {
+                    if (earlyTransitionRequested || activePlayer.playbackState == Player.STATE_ENDED) {
+                        break
+                    }
+                    delay(pollStepMs)
+                    elapsedMs += pollStepMs
+                }
 
                 if (!isActive) break
 
-                // 2. Prepare next refreshed stream on idle player in the background
+                // 2. Prepare next refreshed stream chunk on the idle player
                 isPreparingBackground = true
                 if (idleIndex == 0) isFirstFrameRenderedA = false else isFirstFrameRenderedB = false
                 cycleCounter++
 
-                val nextUri = generateRefreshedUri(currentUri ?: Uri.EMPTY, cycleCounter)
+                val nextUri = generateRefreshedUri(baseStreamUri ?: currentUri ?: Uri.EMPTY, cycleCounter)
                 val nextSource = createMediaSource(nextUri)
+                idlePlayer.stop()
+                idlePlayer.clearMediaItems()
                 idlePlayer.volume = 0f
-                idlePlayer.setMediaSource(nextSource)
+                idlePlayer.setMediaSource(nextSource, /* resetPosition = */ true)
                 idlePlayer.prepare()
                 idlePlayer.playWhenReady = true
 
                 updateTelemetryState()
 
-                // 3. Wait until segment end - crossfadeDurationMs
-                val waitBeforeTransitionMs = (prepLeadTimeMs - crossfadeDurationMs).coerceAtLeast(500L)
-                delay(waitBeforeTransitionMs)
+                // 3. Monitor active player until segment expiration or early completion
+                val remainingTimeMs = (segmentDurationMs - elapsedMs - crossfadeDurationMs).coerceAtLeast(500L)
+                var elapsedWaitMs = 0L
+                while (isActive && elapsedWaitMs < remainingTimeMs) {
+                    if (earlyTransitionRequested || activePlayer.playbackState == Player.STATE_ENDED) {
+                        break
+                    }
+                    delay(pollStepMs)
+                    elapsedWaitMs += pollStepMs
+                }
 
                 if (!isActive) break
 
-                // 4. Ensure incoming video has rendered its first frame before transitioning
-                var waitedForFrameMs = 0L
-                val maxWaitMs = 5000L
-                while (isActive && waitedForFrameMs < maxWaitMs) {
-                    val isReady = if (idleIndex == 0) isFirstFrameRenderedA else isFirstFrameRenderedB
-                    if (isReady && idlePlayer.playbackState == Player.STATE_READY) {
+                // 4. Ensure incoming player is ready with buffered frames before switching
+                var waitReadyMs = 0L
+                val maxWaitReadyMs = 4000L
+                while (isActive && waitReadyMs < maxWaitReadyMs) {
+                    val isFirstFrame = if (idleIndex == 0) isFirstFrameRenderedA else isFirstFrameRenderedB
+                    if (idlePlayer.playbackState == Player.STATE_READY && (isFirstFrame || waitReadyMs >= 1000L)) {
                         break
                     }
                     delay(50)
-                    waitedForFrameMs += 50
+                    waitReadyMs += 50
                 }
 
                 if (!isActive) break
 
-                // 5. Execute smooth crossfade between both players
-                executeCrossfade(currentActiveIndex, idleIndex, crossfadeDurationMs)
+                // 5. Execute smooth transition (instant audio switch + video opacity crossfade)
+                performTransition(currentActiveIndex, idleIndex, crossfadeDurationMs)
 
-                // 6. Incoming player is now active, old player becomes background and is stopped
-                _activePlayerIndex.value = idleIndex
-                activePlayer.stop()
-                activePlayer.volume = 0f
-                isPreparingBackground = false
-                updateTelemetryState()
+                // Loop seamlessly continues to the next cycle with swapped active/idle roles!
             }
         }
     }
 
-    private suspend fun executeCrossfade(fromIndex: Int, toIndex: Int, durationMs: Long) {
-        _isTransitioning.value = true
-        val fromPlayer = if (fromIndex == 0) getPlayerA() else getPlayerB()
-        val toPlayer = if (toIndex == 0) getPlayerA() else getPlayerB()
+    /**
+     * Executes the handover from outgoing player to incoming player:
+     * - Instant audio handover: outgoing volume immediately becomes 0, incoming immediately becomes 1 (no echo).
+     * - Smooth video opacity crossfade between layers over durationMs.
+     * - Outgoing player is cleanly stopped and reset for reuse in subsequent cycles.
+     */
+    private suspend fun performTransition(fromIndex: Int, toIndex: Int, durationMs: Long) {
+        transitionMutex.withLock {
+            _isTransitioning.value = true
+            val fromPlayer = getPlayerByIndex(fromIndex)
+            val toPlayer = getPlayerByIndex(toIndex)
 
-        val steps = (durationMs / 16).toInt().coerceAtLeast(10)
-        val stepDelayMs = durationMs / steps
+            // CRITICAL: Instant Audio Handover!
+            // No overlapping audio crossfade to completely eliminate any echo or phasing between streams.
+            fromPlayer.volume = 0f
+            toPlayer.volume = 1f
 
-        for (step in 0..steps) {
-            val progress = step.toFloat() / steps
+            // Smooth video crossfade
+            val steps = (durationMs / 16).toInt().coerceAtLeast(8)
+            val stepDelayMs = durationMs / steps
 
-            // Equal-power audio crossfade curve
-            val volFrom = cos(progress * (Math.PI.toFloat() / 2f))
-            val volTo = sin(progress * (Math.PI.toFloat() / 2f))
+            for (step in 0..steps) {
+                val progress = step.toFloat() / steps
+                if (fromIndex == 0) {
+                    _alphaA.value = 1f - progress
+                    _alphaB.value = progress
+                } else {
+                    _alphaB.value = 1f - progress
+                    _alphaA.value = progress
+                }
+                delay(stepDelayMs)
+            }
 
-            fromPlayer.volume = volFrom
-            toPlayer.volume = volTo
+            // Finalize video opacities
+            if (toIndex == 0) {
+                _alphaA.value = 1f
+                _alphaB.value = 0f
+            } else {
+                _alphaA.value = 0f
+                _alphaB.value = 1f
+            }
+
+            // Update active player index
+            _activePlayerIndex.value = toIndex
+
+            // Cleanly stop and reset outgoing player so it is ready for subsequent reuse
+            fromPlayer.stop()
+            fromPlayer.clearMediaItems()
+            fromPlayer.volume = 0f
 
             if (fromIndex == 0) {
-                _alphaA.value = 1f - progress
-                _alphaB.value = progress
+                isFirstFrameRenderedA = false
             } else {
-                _alphaB.value = 1f - progress
-                _alphaA.value = progress
+                isFirstFrameRenderedB = false
             }
 
-            delay(stepDelayMs)
+            isPreparingBackground = false
+            earlyTransitionRequested = false
+            _isTransitioning.value = false
+            updateTelemetryState()
         }
-
-        // Finalize transition
-        fromPlayer.volume = 0f
-        toPlayer.volume = 1f
-        if (fromIndex == 0) {
-            _alphaA.value = 0f
-            _alphaB.value = 1f
-        } else {
-            _alphaA.value = 1f
-            _alphaB.value = 0f
-        }
-        _isTransitioning.value = false
     }
 
-    private fun handleActivePlayerEndedEarly() {
+    private fun handleEarlyTransition() {
         scope.launch {
+            if (_isTransitioning.value) return@launch
             val currentActive = _activePlayerIndex.value
             val idleIndex = if (currentActive == 0) 1 else 0
-            val isIdleReady = if (idleIndex == 0) isFirstFrameRenderedA else isFirstFrameRenderedB
-            val idlePlayer = if (idleIndex == 0) getPlayerA() else getPlayerB()
+            val idlePlayer = getPlayerByIndex(idleIndex)
 
-            if (isIdleReady && idlePlayer.playbackState == Player.STATE_READY) {
-                // Immediately crossfade to ready player
-                executeCrossfade(currentActive, idleIndex, 300L)
-                _activePlayerIndex.value = idleIndex
-            } else {
-                // Background player not ready yet; prepare and transition as soon as ready
-                if (!isPreparingBackground) {
-                    isPreparingBackground = true
-                    cycleCounter++
-                    val nextUri = generateRefreshedUri(currentUri ?: Uri.EMPTY, cycleCounter)
-                    idlePlayer.volume = 0f
-                    idlePlayer.setMediaSource(createMediaSource(nextUri))
-                    idlePlayer.prepare()
-                    idlePlayer.playWhenReady = true
-                }
+            if (idlePlayer.playbackState == Player.STATE_READY) {
+                performTransition(currentActive, idleIndex, settings.seamlessCrossfadeDurationMs.coerceIn(150L, 500L))
+            } else if (!isPreparingBackground) {
+                // Background player was not preparing yet; initiate preparation immediately
+                isPreparingBackground = true
+                cycleCounter++
+                val nextUri = generateRefreshedUri(baseStreamUri ?: currentUri ?: Uri.EMPTY, cycleCounter)
+                idlePlayer.stop()
+                idlePlayer.clearMediaItems()
+                idlePlayer.volume = 0f
+                idlePlayer.setMediaSource(createMediaSource(nextUri), /* resetPosition = */ true)
+                idlePlayer.prepare()
+                idlePlayer.playWhenReady = true
             }
         }
     }
@@ -377,11 +437,11 @@ class RawExoPlayerManager(
     private fun generateRefreshedUri(baseUri: Uri, cycle: Int): Uri {
         val uriStr = baseUri.toString()
         if (uriStr.isBlank()) return baseUri
-        // Append or update timestamp/cycle query to generate fresh stream ticket from provider
-        val builder = baseUri.buildUpon()
-        builder.appendQueryParameter("_cycle", cycle.toString())
-        builder.appendQueryParameter("_ts", System.currentTimeMillis().toString())
-        return builder.build()
+        // Generate refreshed stream request ticket with cache-busting timestamp and cycle count
+        return baseUri.buildUpon()
+            .appendQueryParameter("_cycle", cycle.toString())
+            .appendQueryParameter("_ts", System.currentTimeMillis().toString())
+            .build()
     }
 
     private fun retryPlaybackSingle() {
@@ -444,6 +504,7 @@ class RawExoPlayerManager(
         val audioFormat = player.audioFormat
         val idleIndex = if (activeIndex == 0) 1 else 0
         val isIncomingReady = if (idleIndex == 0) isFirstFrameRenderedA else isFirstFrameRenderedB
+        val idlePlayer = if (idleIndex == 0) playerA else playerB
 
         _telemetry.value = _telemetry.value.copy(
             playbackState = player.playbackState,
@@ -458,7 +519,7 @@ class RawExoPlayerManager(
             seamlessActivePlayer = if (activeIndex == 0) "Player A" else "Player B",
             seamlessCycleCount = cycleCounter,
             isSeamlessTransitioning = _isTransitioning.value,
-            incomingReady = isIncomingReady
+            incomingReady = isIncomingReady || idlePlayer?.playbackState == Player.STATE_READY
         )
     }
 

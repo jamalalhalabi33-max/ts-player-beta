@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.app.Activity
 import android.net.Uri
+import android.view.LayoutInflater
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
@@ -20,10 +21,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -60,9 +59,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.example.R
 import com.example.engine.PlayerSettings
 import com.example.engine.RawExoPlayerManager
 import com.example.ui.theme.AccentAmber
@@ -82,6 +86,7 @@ fun PlayerScreen(
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val activity = context as? Activity
     val telemetry by playerManager.telemetry.collectAsState()
     val activeIndex by playerManager.activePlayerIndex.collectAsState()
     val alphaA by playerManager.alphaA.collectAsState()
@@ -100,12 +105,23 @@ fun PlayerScreen(
         AspectRatioFrameLayout.RESIZE_MODE_FIXED_HEIGHT to "Fixed Height"
     )
 
-    // Keep screen turned on while playing
-    DisposableEffect(Unit) {
-        val window = (context as? Activity)?.window
-        window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    // Complete Fullscreen Immersive Mode: Hides status bar & navigation bar completely
+    DisposableEffect(activity) {
+        val window = activity?.window
+        if (window != null) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+            insetsController.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            insetsController.hide(WindowInsetsCompat.Type.systemBars())
+        }
         onDispose {
-            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            val window = activity?.window
+            if (window != null) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+                insetsController.show(WindowInsetsCompat.Type.systemBars())
+            }
         }
     }
 
@@ -126,6 +142,19 @@ fun PlayerScreen(
         onNavigateBack()
     }
 
+    // Dynamic Z-Ordering during seamless transitions: incoming player takes top drawing layer
+    val zIndexA = if (isTransitioning) {
+        if (activeIndex == 1) 2f else 1f // If transitioning to B, A is 1f; if transitioning to A, A is 2f
+    } else {
+        if (activeIndex == 0) 2f else 1f
+    }
+
+    val zIndexB = if (isTransitioning) {
+        if (activeIndex == 0) 2f else 1f // If transitioning to B, B is 2f
+    } else {
+        if (activeIndex == 1) 2f else 1f
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -138,28 +167,29 @@ fun PlayerScreen(
             }
     ) {
         if (playerManager.isSeamlessEnabled) {
-            // Dual-Player Overlapping Video Layers with Opacity Crossfade
+            // Dual-Player Overlapping Video Layers with TextureView for Smooth Alpha Crossfading
             // Layer A (Player A)
             AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
+                    .zIndex(zIndexA)
                     .graphicsLayer { alpha = alphaA }
                     .testTag("raw_exoplayer_view_a"),
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        player = playerManager.getPlayerA()
-                        useController = activeIndex == 0
-                        controllerAutoShow = false
-                        setKeepContentOnPlayerReset(settings.keepLastFrameOnReconnect)
-                        setShowBuffering(
-                            if (settings.hideBufferingSpinner) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS
-                        )
-                        resizeMode = resizeModes[resizeModeIndex].first
-                    }
+                    val view = LayoutInflater.from(ctx).inflate(R.layout.player_view_texture, null) as PlayerView
+                    view.layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    view.player = playerManager.getPlayerA()
+                    view.useController = activeIndex == 0
+                    view.controllerAutoShow = false
+                    view.setKeepContentOnPlayerReset(settings.keepLastFrameOnReconnect)
+                    view.setShowBuffering(
+                        if (settings.hideBufferingSpinner) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS
+                    )
+                    view.resizeMode = resizeModes[resizeModeIndex].first
+                    view
                 },
                 update = { view ->
                     view.player = playerManager.getPlayerA()
@@ -173,23 +203,24 @@ fun PlayerScreen(
             AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
+                    .zIndex(zIndexB)
                     .graphicsLayer { alpha = alphaB }
                     .testTag("raw_exoplayer_view_b"),
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        player = playerManager.getPlayerB()
-                        useController = activeIndex == 1
-                        controllerAutoShow = false
-                        setKeepContentOnPlayerReset(settings.keepLastFrameOnReconnect)
-                        setShowBuffering(
-                            if (settings.hideBufferingSpinner) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS
-                        )
-                        resizeMode = resizeModes[resizeModeIndex].first
-                    }
+                    val view = LayoutInflater.from(ctx).inflate(R.layout.player_view_texture, null) as PlayerView
+                    view.layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    view.player = playerManager.getPlayerB()
+                    view.useController = activeIndex == 1
+                    view.controllerAutoShow = false
+                    view.setKeepContentOnPlayerReset(settings.keepLastFrameOnReconnect)
+                    view.setShowBuffering(
+                        if (settings.hideBufferingSpinner) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS
+                    )
+                    view.resizeMode = resizeModes[resizeModeIndex].first
+                    view
                 },
                 update = { view ->
                     view.player = playerManager.getPlayerB()
@@ -199,30 +230,30 @@ fun PlayerScreen(
                 }
             )
         } else {
-            // Original Single-Player Raw ExoPlayer View
+            // Single-Player Mode with TextureView
             AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
                     .testTag("raw_exoplayer_view"),
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        player = playerManager.getPlayer()
-                        useController = true
-                        controllerAutoShow = false
-                        setKeepContentOnPlayerReset(settings.keepLastFrameOnReconnect)
-                        setShowBuffering(
-                            if (settings.hideBufferingSpinner) {
-                                PlayerView.SHOW_BUFFERING_NEVER
-                            } else {
-                                PlayerView.SHOW_BUFFERING_ALWAYS
-                            }
-                        )
-                        resizeMode = resizeModes[resizeModeIndex].first
-                    }
+                    val view = LayoutInflater.from(ctx).inflate(R.layout.player_view_texture, null) as PlayerView
+                    view.layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    view.player = playerManager.getPlayer()
+                    view.useController = true
+                    view.controllerAutoShow = false
+                    view.setKeepContentOnPlayerReset(settings.keepLastFrameOnReconnect)
+                    view.setShowBuffering(
+                        if (settings.hideBufferingSpinner) {
+                            PlayerView.SHOW_BUFFERING_NEVER
+                        } else {
+                            PlayerView.SHOW_BUFFERING_ALWAYS
+                        }
+                    )
+                    view.resizeMode = resizeModes[resizeModeIndex].first
+                    view
                 },
                 update = { view ->
                     view.player = playerManager.getPlayer()
@@ -232,19 +263,20 @@ fun PlayerScreen(
             )
         }
 
-        // Expressive Top Overlay Bar
+        // Expressive Top Overlay Bar (Positioned nicely for immersive fullscreen)
         AnimatedVisibility(
             visible = isOverlayVisible,
             enter = fadeIn(),
             exit = fadeOut(),
-            modifier = Modifier.align(Alignment.TopCenter)
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .zIndex(10f)
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color.Black.copy(alpha = 0.65f))
-                    .statusBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -310,7 +342,7 @@ fun PlayerScreen(
                                             )
                                             Spacer(modifier = Modifier.width(3.dp))
                                             Text(
-                                                text = if (isTransitioning) "CROSSFADING" else telemetry.seamlessActivePlayer,
+                                                text = if (isTransitioning) "TRANSITIONING" else "${telemetry.seamlessActivePlayer} (#${telemetry.seamlessCycleCount})",
                                                 color = if (isTransitioning) AccentAmber else Color.White,
                                                 fontSize = 10.sp,
                                                 fontWeight = FontWeight.ExtraBold
@@ -395,14 +427,14 @@ fun PlayerScreen(
             }
         }
 
-        // Telemetry Floating Card
+        // Telemetry Floating Card (Positioned nicely above bottom edge in immersive mode)
         AnimatedVisibility(
             visible = isOverlayVisible || showStatsSheet,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .navigationBarsPadding()
+                .zIndex(10f)
                 .padding(16.dp)
         ) {
             Card(
@@ -426,7 +458,7 @@ fun PlayerScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (isTransitioning) "Seamless Crossfade Active (A ⇄ B)"
+                            text = if (isTransitioning) "Seamless Handover Active (A ⇄ B)"
                             else if (playerManager.isSeamlessEnabled) "Seamless Dual-Player: ${telemetry.seamlessActivePlayer} (Cycle #${telemetry.seamlessCycleCount})"
                             else if (telemetry.isPlaying) "Playing Endless TS"
                             else if (telemetry.isBuffering) "Buffering..."
@@ -454,7 +486,7 @@ fun PlayerScreen(
                         }
                         if (playerManager.isSeamlessEnabled) {
                             Text(
-                                text = if (telemetry.incomingReady) "Next Stream: Ready" else "Next Stream: Preparing",
+                                text = if (telemetry.incomingReady) "Next Stream: Primed" else "Next Stream: Preparing",
                                 color = if (telemetry.incomingReady) SuccessGreen else AccentAmber,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
@@ -471,7 +503,7 @@ fun PlayerScreen(
                         )
                         if (playerManager.isSeamlessEnabled) {
                             Text(
-                                text = "Crossfade: ${settings.seamlessCrossfadeDurationMs}ms • Segment: ${settings.seamlessSegmentDurationSec}s",
+                                text = "Transition: ${settings.seamlessCrossfadeDurationMs}ms (Instant Audio) • Segment: ${settings.seamlessSegmentDurationSec}s",
                                 color = AccentPurple,
                                 fontSize = 10.sp
                             )

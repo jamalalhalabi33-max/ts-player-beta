@@ -63,15 +63,23 @@ class InfiniteTsDataSource(
 
         try {
             val bytesRead = upstream.read(buffer, offset, targetLength)
-            if (bytesRead == C.RESULT_END_OF_INPUT && isLiveTs && settings.fastReconnectEnabled) {
-                // Premature EOF on a live stream! Re-open upstream to resume continuous reading
-                reopenUpstream()
-                val retryBytes = upstream.read(buffer, offset, targetLength)
-                return if (retryBytes != C.RESULT_END_OF_INPUT) retryBytes else 0
+            if (bytesRead == C.RESULT_END_OF_INPUT) {
+                if (settings.seamlessPlaybackEnabled) {
+                    // In seamless dual-player mode, let EOF propagate cleanly to ExoPlayer
+                    // so onPlaybackStateChanged(STATE_ENDED) triggers immediate transition to next player!
+                    return C.RESULT_END_OF_INPUT
+                }
+                if (isLiveTs && settings.fastReconnectEnabled) {
+                    // Premature EOF on single-player live stream! Re-open upstream to resume continuous reading
+                    reopenUpstream()
+                    val retryBytes = upstream.read(buffer, offset, targetLength)
+                    return if (retryBytes != C.RESULT_END_OF_INPUT) retryBytes else C.RESULT_END_OF_INPUT
+                }
+                return C.RESULT_END_OF_INPUT
             }
             return bytesRead
         } catch (e: IOException) {
-            if (isLiveTs && settings.fastReconnectEnabled) {
+            if (!settings.seamlessPlaybackEnabled && isLiveTs && settings.fastReconnectEnabled) {
                 try {
                     reopenUpstream()
                     return upstream.read(buffer, offset, targetLength)
